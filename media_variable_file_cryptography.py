@@ -114,10 +114,12 @@ def read_media_variable_file_header(filename):
 def decrypt_file(algo, data, key, iv=None, decode=True):
     decrypt = None
     if algo == 'CALG_AES_128' or algo == 'CALG_AES_256':
-        iv = b"\x00" * 16
+        if iv is None:
+            iv = b"\x00" * 16
         decrypt = AES.new(key, AES.MODE_CBC, iv)
     elif algo == 'CALG_3DES':
-        iv = b"\x00" * 8
+        if iv is None:
+            iv = b"\x00" * 8
         decrypt = DES3.new(key, DES3.MODE_CBC, iv)
 
     decrypted_bytes = decrypt.decrypt(data)
@@ -242,6 +244,9 @@ class media_decryption():
 
         if not decrypted_file:
             return False, None
+
+        if not decode:
+            return True, decrypted_file
 
         decrypted_file =  decrypted_file[:decrypted_file.rfind('\x00')]
         wf_decrypted_ts = "".join(c for c in decrypted_file if c.isprintable())

